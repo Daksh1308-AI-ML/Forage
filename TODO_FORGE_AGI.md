@@ -27,12 +27,12 @@
 
 ## Phase 3: Knowledge Sharing (Weeks 9-12) — MEDIUM PRIORITY
 
-- [ ] 3.1 Implement pattern extraction from solutions (Learner)
-- [ ] 3.2 Build similar solution recommendation (keyword matching)
-- [ ] 3.3 Implement discovery trending & relevance scoring
-- [ ] 3.4 Add cross-domain pattern recognition (basic)
-- [ ] 3.5 Build external API for discoveries
-- [ ] 3.6 Achieve 60%+ reuse rate
+- [x] 3.1 Implement pattern extraction from solutions (Learner)
+- [x] 3.2 Build similar solution recommendation (keyword matching)
+- [x] 3.3 Implement discovery trending & relevance scoring
+- [x] 3.4 Add cross-domain pattern recognition (basic)
+- [x] 3.5 Build external API for discoveries
+- [x] 3.6 Achieve 60%+ reuse rate
 
 ## Phase 4: Incentives & Rewards (Week 13+) — LOW PRIORITY
 

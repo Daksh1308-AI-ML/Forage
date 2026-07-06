@@ -91,7 +91,24 @@ class MemoryDB:
         )''')
 
         self.conn.commit()
+        self._migrate_schema()
         log.info("MemoryDB initialized at %s", self.db_path)
+
+    def _migrate_schema(self):
+        """Add new columns to existing tables (safe for existing databases)."""
+        migrations = [
+            "ALTER TABLE experiments ADD COLUMN reused_from TEXT DEFAULT NULL",
+            "ALTER TABLE patterns ADD COLUMN domain TEXT DEFAULT 'general'",
+            "ALTER TABLE patterns ADD COLUMN reuse_count INTEGER DEFAULT 0",
+            "ALTER TABLE patterns ADD COLUMN last_used DATETIME DEFAULT NULL",
+            "ALTER TABLE discoveries ADD COLUMN trending_score REAL DEFAULT 0.0",
+            "ALTER TABLE discoveries ADD COLUMN reuse_count INTEGER DEFAULT 0",
+        ]
+        for sql in migrations:
+            try:
+                self.conn.execute(sql)
+            except Exception:
+                pass
 
     def close(self):
         """Close the database connection."""
@@ -99,77 +116,72 @@ class MemoryDB:
             self.conn.close()
             log.info("MemoryDB connection closed")
 
-    def store_experiment(self, task_name: str, description: str, solution: str, success: bool, agent_type: str):
+    def store_experiment(self, task_name: str, description: str, solution: str, success: bool, agent_type: str, reused_from: Optional[str] = None):
         """Store an experiment result"""
         c = self.conn.cursor()
         try:
             c.execute('''INSERT OR REPLACE INTO experiments
-                        (task_name, description, solution, success, timestamp, agent_type)
-                        VALUES (?, ?, ?, ?, ?, ?)''',
-                     (task_name, description, solution, int(success), datetime.now().isoformat(), agent_type))
+                        (task_name, description, solution, success, timestamp, agent_type, reused_from)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                     (task_name, description, solution, int(success), datetime.now().isoformat(), agent_type, reused_from))
             self.conn.commit()
-            log.info("Stored experiment '%s' (success=%s)", task_name, success)
+            log.info("Stored experiment '%s' (success=%s, reused_from=%s)", task_name, success, reused_from)
         except Exception as e:
             log.error("Error storing experiment: %s", e)
 
     def find_similar_solution(self, task_description: str) -> Optional[dict]:
-        """Find a previous solution that might be relevant (keyword matching across all words)"""
+        """Find a previous solution that might be relevant (TF-IDF-like keyword matching)."""
         c = self.conn.cursor()
         keywords = [w for w in task_description.lower().split() if len(w) > 2]
         if not keywords:
             return None
 
         best_match = None
-        best_keyword_hits = 0
+        best_score = 0.0
 
-        for keyword in keywords:
-            c.execute('''SELECT * FROM experiments
-                        WHERE description LIKE ? AND success = 1
-                        ORDER BY timestamp DESC LIMIT 5''',
-                     (f"%{keyword}%",))
-            for row in c.fetchall():
-                desc_words = set(row[2].lower().split())
-                hits = sum(1 for kw in keywords if kw in desc_words)
-                if hits > best_keyword_hits:
-                    best_keyword_hits = hits
-                    best_match = {
-                        "task_name": row[1],
-                        "description": row[2],
-                        "solution": row[3],
-                        "agent_type": row[6]
-                    }
+        c.execute('''SELECT * FROM experiments WHERE success = 1''')
+        all_rows = c.fetchall()
+        total_docs = len(all_rows)
 
-        if best_match:
-            log.info("Found similar solution '%s' with %d keyword hits", best_match["task_name"], best_keyword_hits)
-        else:
-            log.info("No similar solution found for description")
-        return best_match
+        for row in all_rows:
+            desc_words = set(row[2].lower().split())
+            hits = 0
+            for kw in keywords:
+                if kw in desc_words:
+                    doc_freq = sum(1 for r in all_rows if kw in r[2].lower().split())
+                    idf = 1.0
+                    if doc_freq > 0 and total_docs > 0:
+                        idf = 1.0 + (total_docs / (1 + doc_freq))
+                    hits += idf
+            score = hits / max(len(keywords), 1)
+            if score > best_score:
+                best_score = score
+                best_match = {
+                    "task_name": row[1],
+                    "description": row[2],
+                    "solution": row[3],
+                    "agent_type": row[6]
+                }
 
-    def store_discovery(self, discovery: str, relevance: float, agent: str):
-        """Store a new discovery"""
-        c = self.conn.cursor()
-        c.execute('''INSERT INTO discoveries (discovery, relevance_score, agent_who_found, timestamp)
-                    VALUES (?, ?, ?, ?)''',
-                 (discovery, relevance, agent, datetime.now().isoformat()))
-        self.conn.commit()
-        log.info("Stored discovery from %s (relevance=%.2f)", agent, relevance)
+        if best_match and best_score >= 0.5:
+            log.info("Found similar solution '%s' with score %.2f", best_match["task_name"], best_score)
+            return best_match
+        log.info("No similar solution found for description (best=%.2f)", best_score)
+        return None
 
-    def get_recent_discoveries(self, limit: int = 5) -> list:
-        """Get recent discoveries to learn from"""
-        c = self.conn.cursor()
-        c.execute('''SELECT discovery, agent_who_found FROM discoveries
-                    ORDER BY timestamp DESC LIMIT ?''', (limit,))
-        return [{"discovery": row[0], "from": row[1]} for row in c.fetchall()]
+    # -----------------------------------------------------------------------
+    # Phase 3: Knowledge Sharing methods
+    # -----------------------------------------------------------------------
 
-    def store_pattern(self, pattern_type: str, description: str, code_template: str, success_rate: float):
+    def store_pattern(self, pattern_type: str, description: str, code_template: str, success_rate: float, domain: str = "general"):
         """Store a reusable pattern learned from previous work."""
         c = self.conn.cursor()
         try:
-            c.execute('''INSERT INTO patterns (pattern_type, description, code_template, success_rate, timestamp)
-                        VALUES (?, ?, ?, ?, ?)''',
-                     (pattern_type, description, code_template, success_rate, datetime.now().isoformat()))
+            c.execute('''INSERT INTO patterns (pattern_type, description, code_template, success_rate, timestamp, domain)
+                        VALUES (?, ?, ?, ?, ?, ?)''',
+                     (pattern_type, description, code_template, success_rate, datetime.now().isoformat(), domain))
             self.conn.commit()
-            log.info("Stored pattern '%s' (success_rate=%.2f)", pattern_type, success_rate)
+            log.info("Stored pattern '%s' in domain '%s' (success_rate=%.2f)", pattern_type, domain, success_rate)
         except Exception as e:
             log.error("Error storing pattern: %s", e)
 
@@ -178,7 +190,7 @@ class MemoryDB:
         c = self.conn.cursor()
         results = []
         for keyword in keywords:
-            c.execute('''SELECT * FROM patterns
+            c.execute('''SELECT id, pattern_type, description, code_template, success_rate, domain, reuse_count FROM patterns
                         WHERE description LIKE ? OR pattern_type LIKE ?
                         ORDER BY success_rate DESC LIMIT ?''',
                      (f"%{keyword}%", f"%{keyword}%", limit))
@@ -188,12 +200,188 @@ class MemoryDB:
                     "pattern_type": row[1],
                     "description": row[2],
                     "code_template": row[3],
-                    "success_rate": row[4]
+                    "success_rate": row[4],
+                    "domain": row[5] if len(row) > 5 else "general",
+                    "reuse_count": row[6] if len(row) > 6 else 0
                 }
                 if entry not in results:
                     results.append(entry)
         log.info("Found %d relevant patterns for keywords", len(results))
         return results[:limit]
+
+    def update_pattern_usage(self, pattern_id: int, success: bool):
+        """Increment reuse count and update success rate for a pattern."""
+        c = self.conn.cursor()
+        try:
+            c.execute('''UPDATE patterns SET reuse_count = reuse_count + 1,
+                        last_used = ? WHERE id = ?''',
+                     (datetime.now().isoformat(), pattern_id))
+            c.execute('''SELECT success_rate, reuse_count FROM patterns WHERE id = ?''', (pattern_id,))
+            row = c.fetchone()
+            if row:
+                old_rate, count = row
+                adjustment = 0.05 if success else -0.05
+                new_rate = max(0.0, min(1.0, old_rate + adjustment))
+                c.execute('''UPDATE patterns SET success_rate = ? WHERE id = ?''', (new_rate, pattern_id))
+            self.conn.commit()
+        except Exception as e:
+            log.error("Error updating pattern usage: %s", e)
+
+    def get_recommendations(self, task_description: str, limit: int = 3) -> dict:
+        """Get both similar solutions and relevant patterns for a task description."""
+        similar = self.find_similar_solution(task_description)
+        keywords = [w for w in task_description.lower().split() if len(w) > 2]
+        patterns = self.find_relevant_patterns(keywords, limit)
+        return {
+            "similar_solution": similar,
+            "relevant_patterns": patterns
+        }
+
+    def get_trending_discoveries(self, limit: int = 10, days: int = 30) -> list:
+        """Get discoveries sorted by trending score (relevance * recency decay)."""
+        self._update_trending_scores(days)
+        c = self.conn.cursor()
+        c.execute('''SELECT discovery, relevance_score, agent_who_found, trending_score, timestamp
+                     FROM discoveries ORDER BY trending_score DESC LIMIT ?''', (limit,))
+        return [
+            {
+                "discovery": row[0],
+                "relevance_score": row[1],
+                "from": row[2],
+                "trending_score": round(row[3], 3),
+                "timestamp": row[4]
+            }
+            for row in c.fetchall()
+        ]
+
+    def _update_trending_scores(self, decay_days: int = 30):
+        """Recalculate trending scores for all discoveries."""
+        c = self.conn.cursor()
+        now = datetime.now()
+        c.execute('''SELECT id, relevance_score, timestamp, reuse_count FROM discoveries''')
+        for row in c.fetchall():
+            disc_id, relevance, ts_str, reuse_count = row
+            try:
+                ts = datetime.fromisoformat(ts_str) if ts_str else now
+            except Exception:
+                ts = now
+            days_old = max(0, (now - ts).total_seconds() / 86400.0)
+            recency_factor = max(0.0, 1.0 - days_old / decay_days)
+            reuse_boost = min(1.0, (reuse_count or 0) * 0.1)
+            trending = relevance * recency_factor + reuse_boost
+            c.execute('''UPDATE discoveries SET trending_score = ? WHERE id = ?''',
+                     (round(trending, 4), disc_id))
+        self.conn.commit()
+
+    def get_cross_domain_patterns(self, min_domains: int = 2, limit: int = 10) -> list:
+        """Find patterns that appear across multiple domains (cross-domain recognition)."""
+        c = self.conn.cursor()
+        c.execute('''SELECT pattern_type, COUNT(DISTINCT domain) as domain_count,
+                            GROUP_CONCAT(DISTINCT domain) as domains,
+                            AVG(success_rate) as avg_success,
+                            SUM(reuse_count) as total_reuse
+                     FROM patterns
+                     GROUP BY pattern_type
+                     HAVING domain_count >= ?
+                     ORDER BY domain_count DESC, avg_success DESC
+                     LIMIT ?''', (min_domains, limit))
+        return [
+            {
+                "pattern_type": row[0],
+                "domain_count": row[1],
+                "domains": row[2].split(",") if row[2] else [],
+                "avg_success_rate": round(row[3], 3) if row[3] else 0.0,
+                "total_reuse": row[4] or 0
+            }
+            for row in c.fetchall()
+        ]
+
+    def search_patterns(self, pattern_type: Optional[str] = None, domain: Optional[str] = None,
+                        min_success_rate: float = 0.0, limit: int = 20, offset: int = 0) -> dict:
+        """Search patterns with filters and pagination."""
+        c = self.conn.cursor()
+        conditions = []
+        params = []
+        if pattern_type:
+            conditions.append("pattern_type LIKE ?")
+            params.append(f"%{pattern_type}%")
+        if domain:
+            conditions.append("domain LIKE ?")
+            params.append(f"%{domain}%")
+        if min_success_rate > 0:
+            conditions.append("success_rate >= ?")
+            params.append(min_success_rate)
+        where = " AND ".join(conditions) if conditions else "1=1"
+
+        c.execute(f'''SELECT COUNT(*) FROM patterns WHERE {where}''', params)
+        total = c.fetchone()[0]
+
+        c.execute(f'''SELECT id, pattern_type, description, code_template, success_rate, domain, reuse_count, last_used FROM patterns WHERE {where}
+                     ORDER BY success_rate DESC, reuse_count DESC
+                     LIMIT ? OFFSET ?''', params + [limit, offset])
+        results = [
+            {
+                "id": row[0],
+                "pattern_type": row[1],
+                "description": row[2],
+                "code_template": row[3],
+                "success_rate": row[4],
+                "domain": row[5] if len(row) > 5 else "general",
+                "reuse_count": row[6] if len(row) > 6 else 0,
+                "last_used": row[7] if len(row) > 7 else None
+            }
+            for row in c.fetchall()
+        ]
+        return {"total": total, "results": results, "offset": offset, "limit": limit}
+
+    def get_reuse_rate(self) -> dict:
+        """Calculate what percentage of experiments reused a previous solution."""
+        c = self.conn.cursor()
+        c.execute('''SELECT COUNT(*) FROM experiments''')
+        total = c.fetchone()[0]
+        c.execute('''SELECT COUNT(*) FROM experiments WHERE reused_from IS NOT NULL''')
+        reused = c.fetchone()[0]
+        rate = round((reused / total * 100), 1) if total > 0 else 0.0
+        return {"total_experiments": total, "reused_count": reused, "reuse_rate": rate}
+
+    def extract_domain(self, description: str) -> str:
+        """Basic domain extraction from a task description."""
+        domain_keywords = {
+            "data": ["data", "dataset", "csv", "json", "database", "sql", "analytics"],
+            "ml": ["machine learning", "neural", "train", "model", "classif", "regression", "deep learning"],
+            "web": ["api", "web", "http", "rest", "server", "endpoint", "route"],
+            "algorithm": ["algorithm", "sort", "search", "graph", "tree", "optimize"],
+            "security": ["security", "encrypt", "auth", "password", "hash", "token"],
+            "automation": ["automation", "script", "pipeline", "workflow", "cron", "scheduler"],
+            "nlp": ["nlp", "text", "natural language", "sentiment", "tokenize", "parse"],
+            "devops": ["deploy", "docker", "ci/cd", "infrastructure", "terraform", "kubernetes"],
+        }
+        desc_lower = description.lower()
+        scores = {}
+        for domain, kws in domain_keywords.items():
+            score = sum(1 for kw in kws if kw in desc_lower)
+            if score > 0:
+                scores[domain] = score
+        if not scores:
+            return "general"
+        return max(scores, key=scores.get)
+
+    def store_discovery(self, discovery: str, relevance: float, agent: str):
+        """Store a new discovery with trending score."""
+        c = self.conn.cursor()
+        initial_trending = relevance
+        c.execute('''INSERT INTO discoveries (discovery, relevance_score, agent_who_found, timestamp, trending_score)
+                    VALUES (?, ?, ?, ?, ?)''',
+                 (discovery, relevance, agent, datetime.now().isoformat(), initial_trending))
+        self.conn.commit()
+        log.info("Stored discovery from %s (relevance=%.2f, trending=%.2f)", agent, relevance, initial_trending)
+
+    def get_recent_discoveries(self, limit: int = 5) -> list:
+        """Get recent discoveries to learn from"""
+        c = self.conn.cursor()
+        c.execute('''SELECT discovery, agent_who_found FROM discoveries
+                    ORDER BY timestamp DESC LIMIT ?''', (limit,))
+        return [{"discovery": row[0], "from": row[1]} for row in c.fetchall()]
 
 # ============================================================================
 # FEATURE 2: MULTI-AGENT AUTONOMOUS COLLABORATION
@@ -616,8 +804,26 @@ async def solve_research_task(task_id: int):
 
     description = result[0]
 
+    recommendations = memory.get_recommendations(description)
+
     def generate():
         try:
+            if recommendations["similar_solution"]:
+                sim = recommendations["similar_solution"]
+                data = json.dumps({
+                    "type": "similar_solution",
+                    "task_name": sim["task_name"],
+                    "hint": f"Found similar solution: {sim['task_name']}"
+                })
+                yield f"event: recommendation\ndata: {data}\n\n"
+
+            if recommendations["relevant_patterns"]:
+                data = json.dumps({
+                    "type": "patterns",
+                    "count": len(recommendations["relevant_patterns"])
+                })
+                yield f"event: recommendation\ndata: {data}\n\n"
+
             yield "event: stage\ndata: {\"agent\": \"thinker\", \"message\": \"Analyzing problem...\"}\n\n"
             thinking = agents["thinker"].think(description)
             yield f"event: result\ndata: {json.dumps({'stage': 'thinker', 'output': thinking[:200] + '...'})}\n\n"
@@ -635,12 +841,15 @@ async def solve_research_task(task_id: int):
             insights = agents["learner"].think(f"What did we learn from this solution? Key insights:\n{code}")
             yield f"event: result\ndata: {json.dumps({'stage': 'learner', 'output': insights[:200] + '...'})}\n\n"
 
+            domain = memory.extract_domain(description)
+            reused_from = recommendations["similar_solution"]["task_name"] if recommendations["similar_solution"] else None
             memory.store_experiment(
                 task_name=f"task_{task_id}",
                 description=description,
                 solution=code,
                 success=True,
-                agent_type="multi-agent-ensemble"
+                agent_type="multi-agent-ensemble",
+                reused_from=reused_from
             )
             memory.store_discovery(insights, 0.8, "ensemble")
 
@@ -648,7 +857,8 @@ async def solve_research_task(task_id: int):
                 pattern_type="code_solution",
                 description=f"Solution for: {description[:100]}",
                 code_template=code[:500],
-                success_rate=0.8
+                success_rate=0.8,
+                domain=domain
             )
 
             task_queue.complete_task(task_id, code)
@@ -676,6 +886,42 @@ async def get_discoveries():
     log.info("API: get_discoveries")
     discoveries = memory.get_recent_discoveries(10)
     return {"discoveries": discoveries}
+
+@app.get("/research/recommendations")
+async def get_recommendations(task_description: str, limit: int = 3):
+    """Get similar solutions and relevant patterns for a task (Phase 3: Knowledge Sharing)."""
+    log.info("API: get_recommendations")
+    return memory.get_recommendations(task_description, limit)
+
+@app.get("/discoveries/trending")
+async def get_trending_discoveries(limit: int = 10, days: int = 30):
+    """Get trending discoveries sorted by trending score (Phase 3: Trending)."""
+    log.info("API: get_trending_discoveries")
+    return {"trending": memory.get_trending_discoveries(limit, days)}
+
+@app.get("/patterns/search")
+async def search_patterns(
+    pattern_type: Optional[str] = None,
+    domain: Optional[str] = None,
+    min_success_rate: float = 0.0,
+    limit: int = 20,
+    offset: int = 0
+):
+    """Search patterns with filters and pagination (Phase 3: Knowledge Sharing)."""
+    log.info("API: search_patterns")
+    return memory.search_patterns(pattern_type, domain, min_success_rate, limit, offset)
+
+@app.get("/patterns/cross-domain")
+async def get_cross_domain_patterns(min_domains: int = 2, limit: int = 10):
+    """Find patterns that appear across multiple domains (Phase 3: Cross-domain)."""
+    log.info("API: get_cross_domain_patterns")
+    return {"cross_domain_patterns": memory.get_cross_domain_patterns(min_domains, limit)}
+
+@app.get("/research/reuse-rate")
+async def get_reuse_rate():
+    """Get the current reuse rate of solutions (Phase 3: Reuse tracking)."""
+    log.info("API: get_reuse_rate")
+    return memory.get_reuse_rate()
 
 @app.post("/workers/register")
 async def register_worker(worker: WorkerRegistration):
@@ -721,7 +967,8 @@ async def root():
         "features": [
             "Multi-Agent Autonomous Collaboration",
             "Persistent Learning Memory",
-            "Distributed Task Orchestration"
+            "Distributed Task Orchestration",
+            "Knowledge Sharing & Discovery Trending"
         ],
         "endpoints": {
             "health": {
@@ -731,7 +978,14 @@ async def root():
                 "POST /research/task": "Create a new research task",
                 "POST /research/solve/{task_id}": "Solve task with agent collaboration",
                 "GET /research/history": "View past experiments",
-                "GET /research/discoveries": "View system discoveries"
+                "GET /research/discoveries": "View system discoveries",
+                "GET /research/recommendations": "Get similar solutions and patterns (Phase 3)",
+                "GET /research/reuse-rate": "Get solution reuse rate (Phase 3)"
+            },
+            "knowledge": {
+                "GET /discoveries/trending": "Get trending discoveries (Phase 3)",
+                "GET /patterns/search": "Search reusable patterns (Phase 3)",
+                "GET /patterns/cross-domain": "Find cross-domain patterns (Phase 3)"
             },
             "workers": {
                 "POST /workers/register": "Register a compute worker",
