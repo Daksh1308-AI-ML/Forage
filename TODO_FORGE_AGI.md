@@ -36,11 +36,11 @@
 
 ## Phase 4: Incentives & Rewards (Week 13+) — LOW PRIORITY
 
-- [ ] 4.1 Design and implement points system
-- [ ] 4.2 Build reputation tracking system
-- [ ] 4.3 Implement quality-based rewards (critic feedback)
-- [ ] 4.4 Create leaderboards and achievement badges
-- [ ] 4.5 Evaluate token / cryptocurrency reward option
+- [x] 4.1 Design and implement points system
+- [x] 4.2 Build reputation tracking system
+- [x] 4.3 Implement quality-based rewards (critic feedback)
+- [x] 4.4 Create leaderboards and achievement badges
+- [x] 4.5 Evaluate token / cryptocurrency reward option
 
 ## Post-MVP Infrastructure Upgrades — MEDIUM PRIORITY
 
