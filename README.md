@@ -1,6 +1,6 @@
 # Forge AGI
 
-Decentralized, distributed AI research platform with autonomous multi-agent collaboration, persistent learning memory, and distributed task orchestration.
+Decentralized, distributed AI research platform with autonomous multi-agent collaboration, persistent learning memory, distributed task orchestration, and production-grade infrastructure.
 
 ## Quick Start
 
@@ -15,14 +15,18 @@ Server starts at `http://localhost:8000`. API docs at `http://localhost:8000/doc
 ## Architecture
 
 ```
-User → API (FastAPI) → Multi-Agent Pipeline → Memory (SQLite)
+User → API (FastAPI) → Multi-Agent Pipeline → Memory (SQLite / PostgreSQL)
                        ├─ Thinker (plans approach)
                        ├─ Coder (writes code)
                        ├─ Critic (reviews quality)
                        └─ Learner (extracts patterns)
+                              ↓
+                    Vector Search (pgvector / numpy)
+                    Redis / RabbitMQ (job distribution)
+                    Prometheus + Grafana (monitoring)
 ```
 
-Tasks can be distributed across worker nodes via the task queue.
+Tasks can be distributed via RabbitMQ or direct DB polling, with Prometheus metrics and a built-in dashboard.
 
 ## API Overview
 
@@ -37,6 +41,9 @@ Tasks can be distributed across worker nodes via the task queue.
 | `GET /workers/stats` | Cluster statistics |
 | `GET /tasks/pending` | Pending tasks for workers |
 | `POST /tasks/{id}/complete` | Submit task result |
+| `GET /metrics` | Prometheus metrics |
+| `GET /dashboard` | Web monitoring UI |
+| `GET /api/stats` | JSON stats for dashboard |
 
 ## Example
 
@@ -48,19 +55,36 @@ curl -X POST http://localhost:8000/research/task \
 curl -X POST http://localhost:8000/research/solve/1
 ```
 
+## Docker Compose (full stack)
+
+```bash
+docker compose up
+```
+
+Starts all services:
+- **forge-agi** — app on port 8000
+- **rabbitmq** — message broker on port 5672 (management UI on 15672)
+- **prometheus** — metrics store on port 9090
+- **grafana** — dashboards on port 3000 (admin/admin)
+
 ## Project Status
 
 - **Phase 1 (Core Platform):** Complete — agents, memory, streaming API, SQLite
 - **Phase 2 (Distributed Compute):** Complete — task queue, worker registration, heartbeat, orphan reassignment
-- **Phase 3 (Knowledge Sharing):** Not started
-- **Phase 4 (Incentives):** Not started
+- **Phase 3 (Knowledge Sharing):** Complete — patterns, trending, cross-domain, recommendations
+- **Post-MVP Infra:** Complete — PostgreSQL, vector search, Prometheus/Grafana, RabbitMQ
+- **Phase 4 (Incentives):** Removed
 
 ## Stack
 
 - **Python** — `3.14`
 - **FastAPI** — REST API + SSE streaming
 - **Anthropic Claude** — agent reasoning
-- **SQLite** — experiments, patterns, discoveries, task queue
+- **SQLite / PostgreSQL** — data storage
+- **sentence-transformers** — semantic embeddings
+- **pgvector / numpy** — vector similarity search
+- **RabbitMQ** — reliable job distribution
+- **Prometheus + Grafana** — monitoring & dashboards
 
 ## Tests
 

@@ -44,10 +44,10 @@
 
 ## Post-MVP Infrastructure Upgrades — MEDIUM PRIORITY
 
-- [ ] Migrate SQLite to PostgreSQL for production scale
-- [ ] Implement vector search for semantic pattern matching
-- [ ] Add web dashboard and monitoring UI (Prometheus + Grafana)
-- [ ] Add RabbitMQ / NATS for reliable job distribution
+- [x] Migrate SQLite to PostgreSQL for production scale
+- [x] Implement vector search for semantic pattern matching
+- [x] Add web dashboard and monitoring UI (Prometheus + Grafana)
+- [x] Add RabbitMQ / NATS for reliable job distribution
 
 ## Advanced Features (Month 7-12) — LOW PRIORITY
 
@@ -73,4 +73,4 @@
 
 ---
 
-**Total:** 49 items | **Last Updated:** June 2026
+**Total:** 49 items | **Last Updated:** July 2026
