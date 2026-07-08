@@ -1,5 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
+import asyncio
 import sys
 sys.path.insert(0, ".")
 
@@ -53,32 +54,33 @@ def test_learner_agent_creation(learner):
 
 
 def test_thinker_system_prompt(thinker):
-    prompt = thinker._get_system_prompt()
+    prompt = asyncio.run(thinker._get_system_prompt())
     assert "Thinker" in prompt
     assert "research" in prompt.lower()
 
 
 def test_coder_system_prompt(coder):
-    prompt = coder._get_system_prompt()
+    prompt = asyncio.run(coder._get_system_prompt())
     assert "Coder" in prompt
     assert "code" in prompt.lower()
 
 
 def test_critic_system_prompt(critic):
-    prompt = critic._get_system_prompt()
+    prompt = asyncio.run(critic._get_system_prompt())
     assert "Critic" in prompt
     assert "review" in prompt.lower()
 
 
 def test_learner_system_prompt(learner):
-    prompt = learner._get_system_prompt()
+    prompt = asyncio.run(learner._get_system_prompt())
     assert "Learner" in prompt
     assert "insight" in prompt.lower()
 
 
-@patch.object(ThinkerAgent, 'think')
-def test_thinker_called(mock_think, thinker):
+def test_thinker_called(thinker):
+    mock_think = MagicMock()
     mock_think.return_value = "Test plan"
+    thinker.think = mock_think
     result = thinker.think("test task")
     assert result == "Test plan"
     mock_think.assert_called_once_with("test task")
