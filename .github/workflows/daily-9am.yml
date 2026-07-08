@@ -1,0 +1,87 @@
+name: Daily 9 AM IST Automation
+
+on:
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  daily-checkin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi uvicorn anthropic pydantic pytest httpx 2>&1
+
+      - name: Run tests (if any)
+        id: tests
+        continue-on-error: true
+        run: |
+          if (Test-Path -LiteralPath "tests") {
+            pytest tests/ -v --tb=short 2>&1 | Tee-Object -FilePath test_output.txt
+          } else {
+            Write-Output "No tests directory yet" | Tee-Object -FilePath test_output.txt
+          }
+        shell: pwsh
+
+      - name: Find next TODO item
+        id: todo
+        run: |
+          $todoFile = "TODO_FORGE_AGI.md"
+          if (-not (Test-Path $todoFile)) {
+            Write-Output "todo=No TODO file found" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $content = Get-Content $todoFile -Raw
+          $unchecked = [regex]::Matches($content, '- \[ \] (.+)')
+          if ($unchecked.Count -gt 0) {
+            $first = $unchecked[0].Groups[1].Value.Trim()
+            Write-Output "todo=$first" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Output "todo=All TODO items completed!" >> $env:GITHUB_OUTPUT
+          }
+        shell: pwsh
+
+      - name: Create GitHub Issue with next TODO
+        if: steps.todo.outputs.todo != 'All TODO items completed!' && steps.todo.outputs.todo != 'No TODO file found'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const todo = '${{ steps.todo.outputs.todo }}';
+            const testOutput = require('fs').readFileSync('test_output.txt', 'utf8').slice(0, 2000);
+            const body = `## Daily Automation — ${new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })}
+
+            ### Next TODO Item
+            **${todo}**
+
+            ### TODO File
+            See [TODO_FORGE_AGI.md](https://github.com/${{ github.repository }}/blob/main/TODO_FORGE_AGI.md)
+
+            ### Last Test Run
+            \`\`\`
+            ${testOutput || 'No test output'}
+            \`\`\`
+
+            ---
+            _Generated automatically at 9:00 AM IST_
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Daily] ${todo.slice(0, 60)}`,
+              body: body,
+              labels: ['automated', 'daily-task']
+            });
