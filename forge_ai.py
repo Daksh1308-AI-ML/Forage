@@ -555,8 +555,7 @@ class TaskQueue:
             assigned_to TEXT,
             result TEXT,
             created_at DATETIME,
-            completed_at DATETIME,
-            user_id TEXT DEFAULT 'anonymous'
+            completed_at DATETIME
         )''')
 
         c.execute('''CREATE TABLE IF NOT EXISTS workers (
@@ -568,19 +567,7 @@ class TaskQueue:
         )''')
 
         self.conn.commit()
-        self._migrate_schema()
         log.info("TaskQueue initialized at %s", self.db_path)
-
-    def _migrate_schema(self):
-        """Add new columns to existing tables (safe for existing databases)."""
-        migrations = [
-            "ALTER TABLE tasks ADD COLUMN user_id TEXT DEFAULT 'anonymous'",
-        ]
-        for sql in migrations:
-            try:
-                self.conn.execute(sql)
-            except Exception:
-                pass
 
     def close(self):
         """Close the database connection."""
@@ -598,14 +585,14 @@ class TaskQueue:
         self.active_workers[worker_id] = True
         log.info("Worker '%s' registered", worker_id)
 
-    def enqueue_task(self, task_name: str, description: str, user_id: str = "anonymous") -> int:
+    def enqueue_task(self, task_name: str, description: str) -> int:
         """Add task to queue"""
         c = self.conn.cursor()
-        c.execute('''INSERT INTO tasks (task_name, description, status, created_at, user_id)
-                    VALUES (?, ?, ?, ?, ?)''',
-                 (task_name, description, 'pending', datetime.now().isoformat(), user_id))
+        c.execute('''INSERT INTO tasks (task_name, description, status, created_at)
+                    VALUES (?, ?, ?, ?)''',
+                 (task_name, description, 'pending', datetime.now().isoformat()))
         self.conn.commit()
-        log.info("Task '%s' enqueued (id=%d, user=%s)", task_name, c.lastrowid, user_id)
+        log.info("Task '%s' enqueued (id=%d)", task_name, c.lastrowid)
         return c.lastrowid
 
     def assign_task(self, task_id: int, worker_id: str) -> bool:
@@ -709,399 +696,6 @@ class TaskQueue:
         self.reassign_orphaned_tasks(stale_threshold_seconds)
 
 # ============================================================================
-# PHASE 4: INCENTIVES & REWARDS SYSTEM
-# ============================================================================
-
-class RewardsSystem:
-    """Points, reputation, achievements, and leaderboard system."""
-
-    POINTS_BASE_TASK = 10
-    POINTS_QUALITY_BONUS_MULTIPLIER = 2
-    POINTS_DISCOVERY = 5
-
-    def __init__(self, memory: MemoryDB):
-        self.memory = memory
-        self.conn = memory.conn
-        self.init_db()
-        self.seed_achievements()
-
-    def init_db(self):
-        """Create rewards-related tables."""
-        c = self.conn.cursor()
-
-        c.execute('''CREATE TABLE IF NOT EXISTS user_points (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT UNIQUE,
-            balance INTEGER DEFAULT 0,
-            total_earned INTEGER DEFAULT 0,
-            last_updated DATETIME
-        )''')
-
-        c.execute('''CREATE TABLE IF NOT EXISTS reward_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT,
-            task_id INTEGER,
-            points INTEGER,
-            reason TEXT,
-            critic_score REAL,
-            timestamp DATETIME
-        )''')
-
-        c.execute('''CREATE TABLE IF NOT EXISTS reputation_scores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT UNIQUE,
-            overall_score REAL DEFAULT 0.0,
-            task_completion_score REAL DEFAULT 0.0,
-            quality_score REAL DEFAULT 0.0,
-            consistency_score REAL DEFAULT 0.0,
-            total_tasks INTEGER DEFAULT 0,
-            last_updated DATETIME
-        )''')
-
-        c.execute('''CREATE TABLE IF NOT EXISTS achievements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE,
-            description TEXT,
-            icon TEXT,
-            criteria TEXT
-        )''')
-
-        c.execute('''CREATE TABLE IF NOT EXISTS user_achievements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT,
-            achievement_id INTEGER,
-            earned_at DATETIME,
-            FOREIGN KEY (achievement_id) REFERENCES achievements(id)
-        )''')
-
-        self.conn.commit()
-        log.info("RewardsSystem initialized")
-
-    def seed_achievements(self):
-        """Insert default achievement definitions if they don't exist."""
-        achievements = [
-            ("first_task", "Complete your first research task", "🚀", "complete 1 task"),
-            ("task_master_10", "Complete 10 research tasks", "🏆", "complete 10 tasks"),
-            ("task_master_50", "Complete 50 research tasks", "👑", "complete 50 tasks"),
-            ("quality_master", "Earn a perfect 10/10 critic score", "⭐", "earn critic score of 10"),
-            ("high_quality_5", "Earn 5 scores of 8+", "💎", "earn 5 scores of 8 or higher"),
-            ("perfect_streak_3", "3 consecutive tasks with score >= 9", "🔥", "3 consecutive scores >= 9"),
-            ("discovery_finder_5", "Contribute to 5 discoveries", "🔬", "5 discoveries contributed"),
-            ("knowledge_miner_10", "Extract 10 reusable patterns", "📚", "10 patterns extracted"),
-            ("first_points", "Earn your first 100 points", "🪙", "earn 100 total points"),
-            ("points_master_1000", "Earn 1000 total points", "💰", "earn 1000 total points"),
-        ]
-        c = self.conn.cursor()
-        for name, desc, icon, criteria in achievements:
-            try:
-                c.execute('''INSERT OR IGNORE INTO achievements (name, description, icon, criteria)
-                            VALUES (?, ?, ?, ?)''', (name, desc, icon, criteria))
-            except Exception:
-                pass
-        self.conn.commit()
-
-    # ------------------------------------------------------------------
-    # Points
-    # ------------------------------------------------------------------
-
-    def get_or_create_user(self, user_id: str) -> dict:
-        """Get or create a user points record."""
-        c = self.conn.cursor()
-        c.execute('''SELECT balance, total_earned FROM user_points WHERE user_id = ?''', (user_id,))
-        row = c.fetchone()
-        if row:
-            return {"user_id": user_id, "balance": row[0], "total_earned": row[1]}
-        c.execute('''INSERT INTO user_points (user_id, balance, total_earned, last_updated)
-                    VALUES (?, 0, 0, ?)''', (user_id, datetime.now().isoformat()))
-        self.conn.commit()
-        return {"user_id": user_id, "balance": 0, "total_earned": 0}
-
-    def award_points(self, user_id: str, points: int, reason: str, task_id: Optional[int] = None, critic_score: Optional[float] = None) -> dict:
-        """Award points to a user and log the event."""
-        c = self.conn.cursor()
-        c.execute('''INSERT INTO user_points (user_id, balance, total_earned, last_updated)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(user_id) DO UPDATE SET
-                        balance = balance + ?,
-                        total_earned = total_earned + ?,
-                        last_updated = ?''',
-                  (user_id, points, points, datetime.now().isoformat(),
-                   points, points, datetime.now().isoformat()))
-        c.execute('''INSERT INTO reward_events (user_id, task_id, points, reason, critic_score, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)''',
-                  (user_id, task_id, points, reason, critic_score, datetime.now().isoformat()))
-        self.conn.commit()
-        c.execute('''SELECT balance, total_earned FROM user_points WHERE user_id = ?''', (user_id,))
-        row = c.fetchone()
-        return {"user_id": user_id, "balance": row[0], "total_earned": row[1], "awarded": points}
-
-    def get_balance(self, user_id: str) -> dict:
-        """Get a user's points balance and total earned."""
-        return self.get_or_create_user(user_id)
-
-    def get_transaction_history(self, user_id: str, limit: int = 20) -> list:
-        """Get recent reward events for a user."""
-        c = self.conn.cursor()
-        c.execute('''SELECT id, task_id, points, reason, critic_score, timestamp
-                     FROM reward_events WHERE user_id = ?
-                     ORDER BY timestamp DESC LIMIT ?''', (user_id, limit))
-        return [
-            {
-                "id": row[0],
-                "task_id": row[1],
-                "points": row[2],
-                "reason": row[3],
-                "critic_score": row[4],
-                "timestamp": row[5],
-            }
-            for row in c.fetchall()
-        ]
-
-    # ------------------------------------------------------------------
-    # Reputation
-    # ------------------------------------------------------------------
-
-    def update_reputation(self, user_id: str, critic_score: float, task_success: bool = True) -> dict:
-        """Update a user's reputation based on a new task result."""
-        c = self.conn.cursor()
-        c.execute('''SELECT overall_score, task_completion_score, quality_score, consistency_score, total_tasks
-                     FROM reputation_scores WHERE user_id = ?''', (user_id,))
-        row = c.fetchone()
-
-        if row:
-            overall, completion, quality, consistency, total = row
-            total += 1
-            new_completion = (completion * (total - 1) + (1.0 if task_success else 0.0)) / total
-            new_quality = (quality * (total - 1) + (critic_score / 10.0)) / total
-            scores = [critic_score / 10.0]
-            c.execute('''SELECT critic_score FROM reward_events
-                         WHERE user_id = ? AND critic_score IS NOT NULL
-                         ORDER BY timestamp DESC LIMIT 4''', (user_id,))
-            prev = [r[0] for r in c.fetchall() if r[0] is not None]
-            if prev:
-                scores = [critic_score / 10.0] + prev[:4]
-            variance = sum((s - new_quality) ** 2 for s in scores) / len(scores)
-            new_consistency = max(0.0, 1.0 - variance * 2.0)
-            new_overall = (new_completion * 0.3 + new_quality * 0.5 + new_consistency * 0.2)
-
-            c.execute('''UPDATE reputation_scores SET
-                         overall_score = ?, task_completion_score = ?, quality_score = ?,
-                         consistency_score = ?, total_tasks = ?, last_updated = ?
-                         WHERE user_id = ?''',
-                      (round(new_overall, 4), round(new_completion, 4), round(new_quality, 4),
-                       round(new_consistency, 4), total, datetime.now().isoformat(), user_id))
-        else:
-            new_overall = 0.5 if task_success else 0.3
-            c.execute('''INSERT INTO reputation_scores
-                         (user_id, overall_score, task_completion_score, quality_score, consistency_score, total_tasks, last_updated)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                      (user_id, new_overall, 1.0 if task_success else 0.0, critic_score / 10.0, 1.0, 1, datetime.now().isoformat()))
-
-        self.conn.commit()
-        return self.get_reputation(user_id)
-
-    def get_reputation(self, user_id: str) -> dict:
-        """Get a user's reputation scores."""
-        c = self.conn.cursor()
-        c.execute('''SELECT overall_score, task_completion_score, quality_score, consistency_score, total_tasks, last_updated
-                     FROM reputation_scores WHERE user_id = ?''', (user_id,))
-        row = c.fetchone()
-        if row:
-            return {
-                "user_id": user_id,
-                "overall_score": row[0],
-                "task_completion_score": row[1],
-                "quality_score": row[2],
-                "consistency_score": row[3],
-                "total_tasks": row[4],
-                "last_updated": row[5],
-            }
-        return {"user_id": user_id, "overall_score": 0.0, "total_tasks": 0}
-
-    # ------------------------------------------------------------------
-    # Achievements
-    # ------------------------------------------------------------------
-
-    def check_achievements(self, user_id: str) -> list:
-        """Check and award any newly earned achievements for a user."""
-        c = self.conn.cursor()
-        new_achievements = []
-        user_data = self.get_or_create_user(user_id)
-        rep = self.get_reputation(user_id)
-        total_tasks = rep["total_tasks"]
-        total_earned = user_data["total_earned"]
-
-        c.execute('''SELECT a.id, a.name, a.description, a.icon, a.criteria
-                     FROM achievements a
-                     WHERE a.id NOT IN (
-                         SELECT achievement_id FROM user_achievements WHERE user_id = ?
-                     )''', (user_id,))
-        available = c.fetchall()
-
-        c.execute('''SELECT critic_score FROM reward_events
-                     WHERE user_id = ? AND critic_score IS NOT NULL
-                     ORDER BY timestamp DESC''', (user_id,))
-        scores = [r[0] for r in c.fetchall()]
-
-        for ach_id, name, desc, icon, criteria in available:
-            earned = False
-            if name == "first_task" and total_tasks >= 1:
-                earned = True
-            elif name == "task_master_10" and total_tasks >= 10:
-                earned = True
-            elif name == "task_master_50" and total_tasks >= 50:
-                earned = True
-            elif name == "quality_master" and any(s == 10.0 for s in scores):
-                earned = True
-            elif name == "high_quality_5" and sum(1 for s in scores if s >= 8) >= 5:
-                earned = True
-            elif name == "perfect_streak_3":
-                streak = 0
-                for s in scores:
-                    if s >= 9:
-                        streak += 1
-                        if streak >= 3:
-                            earned = True
-                            break
-                    else:
-                        streak = 0
-            elif name == "discovery_finder_5":
-                c.execute('''SELECT COUNT(*) FROM discoveries WHERE agent_who_found = ?''', (user_id,))
-                if c.fetchone()[0] >= 5:
-                    earned = True
-            elif name == "knowledge_miner_10":
-                c.execute('''SELECT COUNT(*) FROM patterns''')
-                if c.fetchone()[0] >= 10:
-                    earned = True
-            elif name == "first_points" and total_earned >= 100:
-                earned = True
-            elif name == "points_master_1000" and total_earned >= 1000:
-                earned = True
-
-            if earned:
-                c.execute('''INSERT INTO user_achievements (user_id, achievement_id, earned_at)
-                            VALUES (?, ?, ?)''', (user_id, ach_id, datetime.now().isoformat()))
-                new_achievements.append({"id": ach_id, "name": name, "description": desc, "icon": icon})
-
-        if new_achievements:
-            self.conn.commit()
-            log.info("Awarded %d new achievement(s) to user '%s': %s",
-                     len(new_achievements), user_id, [a["name"] for a in new_achievements])
-        return new_achievements
-
-    def get_user_achievements(self, user_id: str) -> list:
-        """Get all achievements earned by a user."""
-        c = self.conn.cursor()
-        c.execute('''SELECT a.id, a.name, a.description, a.icon, ua.earned_at
-                     FROM user_achievements ua
-                     JOIN achievements a ON a.id = ua.achievement_id
-                     WHERE ua.user_id = ?
-                     ORDER BY ua.earned_at DESC''', (user_id,))
-        return [
-            {"id": row[0], "name": row[1], "description": row[2], "icon": row[3], "earned_at": row[4]}
-            for row in c.fetchall()
-        ]
-
-    def get_all_achievements(self) -> list:
-        """Get all available achievements."""
-        c = self.conn.cursor()
-        c.execute('''SELECT id, name, description, icon, criteria FROM achievements ORDER BY id''')
-        return [
-            {"id": row[0], "name": row[1], "description": row[2], "icon": row[3], "criteria": row[4]}
-            for row in c.fetchall()
-        ]
-
-    # ------------------------------------------------------------------
-    # Leaderboard
-    # ------------------------------------------------------------------
-
-    def get_leaderboard(self, metric: str = "points", limit: int = 20) -> list:
-        """Get leaderboard ranked by the given metric.
-
-        Supported metrics: points, reputation, tasks, quality.
-        """
-        c = self.conn.cursor()
-        if metric == "points":
-            c.execute('''SELECT user_id, balance, total_earned FROM user_points
-                         ORDER BY total_earned DESC LIMIT ?''', (limit,))
-            return [
-                {"rank": i + 1, "user_id": row[0], "balance": row[1], "total_earned": row[2]}
-                for i, row in enumerate(c.fetchall())
-            ]
-        elif metric == "reputation":
-            c.execute('''SELECT user_id, overall_score, quality_score, total_tasks FROM reputation_scores
-                         ORDER BY overall_score DESC LIMIT ?''', (limit,))
-            return [
-                {"rank": i + 1, "user_id": row[0], "overall_score": row[1], "quality_score": row[2], "total_tasks": row[3]}
-                for i, row in enumerate(c.fetchall())
-            ]
-        elif metric == "tasks":
-            c.execute('''SELECT user_id, total_tasks, quality_score FROM reputation_scores
-                         ORDER BY total_tasks DESC LIMIT ?''', (limit,))
-            return [
-                {"rank": i + 1, "user_id": row[0], "total_tasks": row[1], "quality_score": row[2]}
-                for i, row in enumerate(c.fetchall())
-            ]
-        elif metric == "quality":
-            c.execute('''SELECT user_id, quality_score, total_tasks FROM reputation_scores
-                         ORDER BY quality_score DESC LIMIT ?''', (limit,))
-            return [
-                {"rank": i + 1, "user_id": row[0], "quality_score": row[1], "total_tasks": row[2]}
-                for i, row in enumerate(c.fetchall())
-            ]
-        return []
-
-    @staticmethod
-    def parse_critic_score(criticism: str) -> float:
-        """Extract the numeric score from a critic's output.
-
-        Looks for patterns like 'Overall score: X/10', 'Score: X/10', or 'X/10'.
-        Returns 0.0 if unable to parse.
-        """
-        import re
-        patterns = [
-            r"overall score[:\s]*(\d+(?:\.\d+)?)\s*/\s*10",
-            r"score[:\s]*(\d+(?:\.\d+)?)\s*/\s*10",
-            r"(\d+(?:\.\d+)?)\s*/\s*10",
-        ]
-        for p in patterns:
-            match = re.search(p, criticism, re.IGNORECASE)
-            if match:
-                score = float(match.group(1))
-                return max(0.0, min(10.0, score))
-        log.warning("Could not parse critic score from output, defaulting to 0.0")
-        return 0.0
-
-    def process_task_completion(self, user_id: str, task_id: int, critic_score: float, task_success: bool = True) -> dict:
-        """Full rewards pipeline for a completed task.
-
-        Awards base points, quality bonus, updates reputation, and checks achievements.
-        """
-        points = self.POINTS_BASE_TASK
-        if critic_score >= 8.0:
-            bonus = int(critic_score * self.POINTS_QUALITY_BONUS_MULTIPLIER)
-            points += bonus
-
-        result = self.award_points(
-            user_id=user_id,
-            points=points,
-            reason="task_completed" if critic_score < 8.0 else "task_completed_with_quality_bonus",
-            task_id=task_id,
-            critic_score=critic_score
-        )
-        rep = self.update_reputation(user_id, critic_score, task_success)
-        new_achievements = self.check_achievements(user_id)
-
-        return {
-            "points_awarded": points,
-            "new_balance": result["balance"],
-            "total_earned": result["total_earned"],
-            "reputation": rep,
-            "new_achievements": new_achievements,
-        }
-
-
-# ============================================================================
 # LIFESPAN (startup / shutdown)
 # ============================================================================
 
@@ -1146,7 +740,6 @@ app = FastAPI(title="Forge AGI", description="Distributed AI Research Platform",
 
 memory = MemoryDB()
 task_queue = TaskQueue()
-rewards = RewardsSystem(memory)
 agents = {
     "thinker": ThinkerAgent(memory),
     "coder": CoderAgent(memory),
@@ -1157,7 +750,6 @@ agents = {
 class ResearchTask(BaseModel):
     task_name: str
     description: str
-    user_id: Optional[str] = "anonymous"
 
 class WorkerRegistration(BaseModel):
     worker_id: str
@@ -1181,8 +773,8 @@ async def health_check():
 @app.post("/research/task")
 async def create_research_task(task: ResearchTask):
     """Create a new research task that agents will solve collaboratively"""
-    log.info("API: create_research_task '%s' by user '%s'", task.task_name, task.user_id)
-    task_id = task_queue.enqueue_task(task.task_name, task.description, task.user_id)
+    log.info("API: create_research_task '%s'", task.task_name)
+    task_id = task_queue.enqueue_task(task.task_name, task.description)
 
     similar = memory.find_similar_solution(task.description)
     if similar:
@@ -1205,12 +797,12 @@ async def solve_research_task(task_id: int):
     """Solve a research task using multi-agent collaboration"""
     log.info("API: solve_research_task task_id=%d", task_id)
     c = task_queue.conn.cursor()
-    c.execute('SELECT description, user_id FROM tasks WHERE id = ?', (task_id,))
-    row = c.fetchone()
-    if not row:
+    c.execute('SELECT description FROM tasks WHERE id = ?', (task_id,))
+    result = c.fetchone()
+    if not result:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    description, user_id = row
+    description = result[0]
 
     recommendations = memory.get_recommendations(description)
 
@@ -1259,7 +851,7 @@ async def solve_research_task(task_id: int):
                 agent_type="multi-agent-ensemble",
                 reused_from=reused_from
             )
-            memory.store_discovery(insights, 0.8, user_id)
+            memory.store_discovery(insights, 0.8, "ensemble")
 
             memory.store_pattern(
                 pattern_type="code_solution",
@@ -1270,17 +862,6 @@ async def solve_research_task(task_id: int):
             )
 
             task_queue.complete_task(task_id, code)
-
-            critic_score = RewardsSystem.parse_critic_score(criticism)
-            rewards_result = rewards.process_task_completion(user_id, task_id, critic_score)
-
-            rewards_data = json.dumps({
-                "points_awarded": rewards_result["points_awarded"],
-                "new_balance": rewards_result["new_balance"],
-                "critic_score": critic_score,
-                "new_achievements": rewards_result["new_achievements"],
-            })
-            yield f"event: rewards\ndata: {rewards_data}\n\n"
 
             yield f"event: complete\ndata: {json.dumps({'status': 'completed', 'task_id': task_id})}\n\n"
 
@@ -1377,50 +958,6 @@ async def complete_task(task_id: int, completion: TaskCompletion):
     task_queue.complete_task(task_id, completion.result)
     return {"status": "completed", "task_id": task_id}
 
-# ---------------------------------------------------------------------------
-# Phase 4: Incentives & Rewards Endpoints
-# ---------------------------------------------------------------------------
-
-@app.get("/rewards/balance/{user_id}")
-async def get_points_balance(user_id: str):
-    """Get a user's points balance (Phase 4: Points System)."""
-    log.info("API: get_points_balance user='%s'", user_id)
-    return rewards.get_balance(user_id)
-
-@app.get("/rewards/history/{user_id}")
-async def get_reward_history(user_id: str, limit: int = 20):
-    """Get a user's reward transaction history (Phase 4: Points System)."""
-    log.info("API: get_reward_history user='%s'", user_id)
-    return {"transactions": rewards.get_transaction_history(user_id, limit)}
-
-@app.get("/rewards/reputation/{user_id}")
-async def get_reputation(user_id: str):
-    """Get a user's reputation scores (Phase 4: Reputation)."""
-    log.info("API: get_reputation user='%s'", user_id)
-    return rewards.get_reputation(user_id)
-
-@app.get("/rewards/leaderboard")
-async def get_leaderboard(metric: str = "points", limit: int = 20):
-    """Get the leaderboard ranked by points, reputation, tasks, or quality (Phase 4: Leaderboards)."""
-    log.info("API: get_leaderboard metric='%s' limit=%d", metric, limit)
-    return {"leaderboard": rewards.get_leaderboard(metric, limit)}
-
-@app.get("/rewards/achievements")
-async def list_achievements():
-    """List all available achievements (Phase 4: Achievements)."""
-    log.info("API: list_achievements")
-    return {"achievements": rewards.get_all_achievements()}
-
-@app.get("/rewards/achievements/{user_id}")
-async def get_user_achievements(user_id: str):
-    """Get achievements earned by a user (Phase 4: Achievements)."""
-    log.info("API: get_user_achievements user='%s'", user_id)
-    return {"achievements": rewards.get_user_achievements(user_id)}
-
-# ---------------------------------------------------------------------------
-# Root
-# ---------------------------------------------------------------------------
-
 @app.get("/")
 async def root():
     """API overview"""
@@ -1431,8 +968,7 @@ async def root():
             "Multi-Agent Autonomous Collaboration",
             "Persistent Learning Memory",
             "Distributed Task Orchestration",
-            "Knowledge Sharing & Discovery Trending",
-            "Incentives & Rewards System"
+            "Knowledge Sharing & Discovery Trending"
         ],
         "endpoints": {
             "health": {
@@ -1457,14 +993,6 @@ async def root():
                 "GET /workers/stats": "Get cluster statistics",
                 "GET /tasks/pending": "Get pending tasks",
                 "POST /tasks/{task_id}/complete": "Mark task complete"
-            },
-            "rewards": {
-                "GET /rewards/balance/{user_id}": "Get points balance (Phase 4)",
-                "GET /rewards/history/{user_id}": "Get reward transaction history (Phase 4)",
-                "GET /rewards/reputation/{user_id}": "Get reputation scores (Phase 4)",
-                "GET /rewards/leaderboard": "Get leaderboard (Phase 4)",
-                "GET /rewards/achievements": "List all achievements (Phase 4)",
-                "GET /rewards/achievements/{user_id}": "Get user achievements (Phase 4)"
             }
         }
     }
