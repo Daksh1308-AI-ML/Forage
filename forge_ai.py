@@ -400,6 +400,38 @@ class MemoryDB:
             agent_who_found TEXT,
             timestamp DATETIME
         )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS pipelines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            description TEXT,
+            definition TEXT,
+            created_at DATETIME,
+            updated_at DATETIME
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS pipeline_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pipeline_id INTEGER,
+            status TEXT,
+            started_at DATETIME,
+            completed_at DATETIME,
+            results TEXT,
+            FOREIGN KEY (pipeline_id) REFERENCES pipelines(id)
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS pipeline_run_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER,
+            task_name TEXT,
+            agent_type TEXT,
+            description TEXT,
+            depends_on TEXT,
+            context_from TEXT,
+            status TEXT,
+            result TEXT,
+            error TEXT,
+            started_at DATETIME,
+            completed_at DATETIME,
+            FOREIGN KEY (run_id) REFERENCES pipeline_runs(id)
+        )''')
         conn.commit()
         self._migrate_schema_sync()
         log.info("MemoryDB initialized at %s", self.db_path)
@@ -450,6 +482,38 @@ class MemoryDB:
                 relevance_score REAL,
                 agent_who_found TEXT,
                 timestamp DATETIME
+            )''')
+            await c.execute('''CREATE TABLE IF NOT EXISTS pipelines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE,
+                description TEXT,
+                definition TEXT,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )''')
+            await c.execute('''CREATE TABLE IF NOT EXISTS pipeline_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pipeline_id INTEGER,
+                status TEXT,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                results TEXT,
+                FOREIGN KEY (pipeline_id) REFERENCES pipelines(id)
+            )''')
+            await c.execute('''CREATE TABLE IF NOT EXISTS pipeline_run_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER,
+                task_name TEXT,
+                agent_type TEXT,
+                description TEXT,
+                depends_on TEXT,
+                context_from TEXT,
+                status TEXT,
+                result TEXT,
+                error TEXT,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                FOREIGN KEY (run_id) REFERENCES pipeline_runs(id)
             )''')
             await c.commit()
             await self._migrate_schema()
@@ -790,6 +854,247 @@ class MemoryDB:
                 ORDER BY timestamp DESC LIMIT ?''', (limit,)
         )
         return [{"discovery": row[0], "from": row[1]} for row in rows]
+
+# ============================================================================
+# FEATURE 4: MULTI-TASK WORKFLOW PIPELINES
+# ============================================================================
+
+class PipelineExecutor:
+    """Executes multi-task DAG workflows using the agent ensemble."""
+
+    def __init__(self, memory: MemoryDB, agents: dict, task_queue):
+        self.memory = memory
+        self.agents = agents
+        self.task_queue = task_queue
+        self._run_events: dict[int, asyncio.Event] = {}
+
+    async def create_pipeline(self, name: str, description: str, definition: dict) -> int:
+        self._validate_definition(definition)
+        row_id = await self.memory.backend.execute_insert_id(
+            '''INSERT INTO pipelines (name, description, definition, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?)''',
+            (name, description, json.dumps(definition), datetime.now().isoformat(), datetime.now().isoformat())
+        )
+        await self.memory.backend.commit()
+        log.info("Pipeline '%s' created (id=%d)", name, row_id)
+        return row_id
+
+    async def get_pipeline(self, pipeline_id: int) -> Optional[dict]:
+        row = await self.memory.backend.fetchone(
+            'SELECT id, name, description, definition, created_at, updated_at FROM pipelines WHERE id = ?',
+            (pipeline_id,)
+        )
+        if not row:
+            return None
+        return {
+            "id": row[0], "name": row[1], "description": row[2],
+            "definition": json.loads(row[3]),
+            "created_at": row[4], "updated_at": row[5]
+        }
+
+    async def list_pipelines(self) -> list:
+        rows = await self.memory.backend.fetchall(
+            'SELECT id, name, description, created_at FROM pipelines ORDER BY created_at DESC'
+        )
+        return [{"id": r[0], "name": r[1], "description": r[2], "created_at": r[3]} for r in rows]
+
+    async def delete_pipeline(self, pipeline_id: int) -> bool:
+        await self.memory.backend.execute('DELETE FROM pipelines WHERE id = ?', (pipeline_id,))
+        await self.memory.backend.commit()
+        return True
+
+    async def run_pipeline(self, pipeline_id: int) -> int:
+        pipeline = await self.get_pipeline(pipeline_id)
+        if not pipeline:
+            raise ValueError(f"Pipeline {pipeline_id} not found")
+
+        run_id = await self.memory.backend.execute_insert_id(
+            '''INSERT INTO pipeline_runs (pipeline_id, status, started_at) VALUES (?, ?, ?)''',
+            (pipeline_id, 'running', datetime.now().isoformat())
+        )
+        await self.memory.backend.commit()
+        log.info("Pipeline run %d started for pipeline %d", run_id, pipeline_id)
+
+        tasks = pipeline["definition"]["tasks"]
+        ordered = self._topological_sort(tasks)
+
+        loop = asyncio.get_running_loop()
+        loop.create_task(self._execute_pipeline(run_id, ordered, tasks, pipeline))
+        return run_id
+
+    async def _execute_pipeline(self, run_id: int, ordered: list, tasks: dict, pipeline: dict):
+        try:
+            context: dict[str, str] = {}
+            for task_name in ordered:
+                tdef = tasks[task_name]
+                agent_type = tdef.get("agent", "thinker")
+                agent = self.agents.get(agent_type)
+                if not agent:
+                    raise ValueError(f"Unknown agent '{agent_type}' for task '{task_name}'")
+
+                dep_context = ""
+                for dep in tdef.get("depends_on", []):
+                    if dep in context:
+                        dep_context += f"\n--- Output from '{dep}' ---\n{context[dep]}\n"
+
+                prompt = tdef["description"]
+                if dep_context:
+                    prompt = f"Context from previous tasks:\n{dep_context}\n\nNow complete this task:\n{tdef['description']}"
+
+                await self._store_run_task_start(run_id, task_name, agent_type, tdef["description"],
+                                                  tdef.get("depends_on", []), tdef.get("context_from", []))
+                log.info("Pipeline run %d: executing task '%s' with agent '%s'", run_id, task_name, agent_type)
+
+                result = await agent.think(prompt)
+                context[task_name] = result
+                await self._store_run_task_complete(run_id, task_name, result)
+
+            await self.memory.backend.execute(
+                '''UPDATE pipeline_runs SET status = ?, completed_at = ?, results = ? WHERE id = ?''',
+                ('completed', datetime.now().isoformat(), json.dumps(context), run_id)
+            )
+            await self.memory.backend.commit()
+            log.info("Pipeline run %d completed successfully", run_id)
+        except Exception as e:
+            log.error("Pipeline run %d failed: %s", run_id, e)
+            await self.memory.backend.execute(
+                '''UPDATE pipeline_runs SET status = ?, completed_at = ?, results = ? WHERE id = ?''',
+                ('failed', datetime.now().isoformat(), json.dumps({"error": str(e)}), run_id)
+            )
+            await self.memory.backend.commit()
+        finally:
+            event = self._run_events.pop(run_id, None)
+            if event:
+                event.set()
+
+    async def _store_run_task_start(self, run_id: int, task_name: str, agent_type: str,
+                                     description: str, depends_on: list, context_from: list):
+        await self.memory.backend.execute(
+            '''INSERT INTO pipeline_run_tasks (run_id, task_name, agent_type, description,
+               depends_on, context_from, status, started_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            (run_id, task_name, agent_type, description,
+             json.dumps(depends_on), json.dumps(context_from),
+             'running', datetime.now().isoformat())
+        )
+        await self.memory.backend.commit()
+
+    async def _store_run_task_complete(self, run_id: int, task_name: str, result: str, error: Optional[str] = None):
+        status = 'failed' if error else 'completed'
+        await self.memory.backend.execute(
+            '''UPDATE pipeline_run_tasks SET status = ?, result = ?, error = ?, completed_at = ?
+               WHERE run_id = ? AND task_name = ?''',
+            (status, result, error, datetime.now().isoformat(), run_id, task_name)
+        )
+        await self.memory.backend.commit()
+
+    async def get_run(self, run_id: int) -> Optional[dict]:
+        row = await self.memory.backend.fetchone(
+            '''SELECT id, pipeline_id, status, started_at, completed_at, results
+               FROM pipeline_runs WHERE id = ?''', (run_id,)
+        )
+        if not row:
+            return None
+        tasks = await self.memory.backend.fetchall(
+            '''SELECT task_name, agent_type, description, depends_on, context_from, status, result, error,
+                      started_at, completed_at
+               FROM pipeline_run_tasks WHERE run_id = ? ORDER BY id''', (run_id,)
+        )
+        return {
+            "id": row[0], "pipeline_id": row[1], "status": row[2],
+            "started_at": row[3], "completed_at": row[4],
+            "results": json.loads(row[5]) if row[5] else {},
+            "tasks": [
+                {
+                    "task_name": t[0], "agent_type": t[1], "description": t[2],
+                    "depends_on": json.loads(t[3]) if t[3] else [],
+                    "context_from": json.loads(t[4]) if t[4] else [],
+                    "status": t[5], "result": t[6], "error": t[7],
+                    "started_at": t[8], "completed_at": t[9]
+                }
+                for t in tasks
+            ]
+        }
+
+    async def list_runs(self, limit: int = 20) -> list:
+        rows = await self.memory.backend.fetchall(
+            '''SELECT id, pipeline_id, status, started_at, completed_at
+               FROM pipeline_runs ORDER BY id DESC LIMIT ?''', (limit,)
+        )
+        return [
+            {"id": r[0], "pipeline_id": r[1], "status": r[2],
+             "started_at": r[3], "completed_at": r[4]}
+            for r in rows
+        ]
+
+    async def stream_run(self, run_id: int):
+        run = await self.get_run(run_id)
+        if not run:
+            return
+
+        yield f"event: run_start\ndata: {json.dumps({'run_id': run_id, 'status': run['status']})}\n\n"
+
+        for task in run["tasks"]:
+            agent = task["agent_type"]
+            msg = f"Executing task '{task['task_name']}' with {agent} agent..."
+            yield f"event: stage\ndata: {json.dumps({'agent': agent, 'task': task['task_name'], 'message': msg})}\n\n"
+
+            if task["status"] == "completed":
+                output = task["result"][:200] + "..." if task["result"] and len(task["result"]) > 200 else (task["result"] or "")
+                yield f"event: result\ndata: {json.dumps({'task': task['task_name'], 'agent': agent, 'output': output})}\n\n"
+            elif task["status"] == "failed":
+                err = task.get("error", "Unknown error")
+                yield f"event: result\ndata: {json.dumps({'task': task['task_name'], 'agent': agent, 'output': f'ERROR: {err}'})}\n\n"
+
+        yield f"event: complete\ndata: {json.dumps({'status': run['status'], 'run_id': run_id})}\n\n"
+
+    def _validate_definition(self, definition: dict):
+        tasks = definition.get("tasks")
+        if tasks is None or not isinstance(tasks, dict):
+            raise ValueError("Pipeline definition must contain a 'tasks' object")
+        if not tasks:
+            raise ValueError("Pipeline must have at least one task")
+        for tname, tdef in tasks.items():
+            if "description" not in tdef:
+                raise ValueError(f"Task '{tname}' missing required field 'description'")
+            agent = tdef.get("agent", "thinker")
+            if agent not in ("thinker", "coder", "critic", "learner"):
+                raise ValueError(f"Task '{tname}' has unknown agent '{agent}'")
+            for dep in tdef.get("depends_on", []):
+                if dep not in tasks:
+                    raise ValueError(f"Task '{tname}' depends on unknown task '{dep}'")
+        self._detect_cycles(tasks)
+
+    def _detect_cycles(self, tasks: dict):
+        visited = set()
+        rec_stack = set()
+        def dfs(node):
+            if node in rec_stack:
+                raise ValueError(f"Cycle detected in pipeline involving task '{node}'")
+            if node in visited:
+                return
+            visited.add(node)
+            rec_stack.add(node)
+            for dep in tasks[node].get("depends_on", []):
+                dfs(dep)
+            rec_stack.remove(node)
+        for tname in tasks:
+            if tname not in visited:
+                dfs(tname)
+
+    def _topological_sort(self, tasks: dict) -> list:
+        visited = set()
+        result = []
+        def dfs(node):
+            if node in visited:
+                return
+            visited.add(node)
+            for dep in tasks[node].get("depends_on", []):
+                dfs(dep)
+            result.append(node)
+        for tname in tasks:
+            dfs(tname)
+        return result
 
 # ============================================================================
 # FEATURE 2: MULTI-AGENT AUTONOMOUS COLLABORATION
@@ -1136,68 +1441,113 @@ class TaskQueue:
 # RABBITMQ MESSAGE BROKER
 # ============================================================================
 
+class LocalMessageBroker:
+    """In-process async message queue when RabbitMQ is unavailable."""
+
+    def __init__(self):
+        self._queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._connected = False
+
+    async def connect(self):
+        self._connected = True
+        log.info("LocalMessageBroker ready (in-process queue)")
+        return True
+
+    async def publish_task(self, task_id: int, task_data: dict):
+        if not self._connected:
+            return False
+        await self._queue.put({"task_id": task_id, **task_data})
+        log.debug("Published task %d to local queue", task_id)
+        return True
+
+    async def consume(self):
+        while self._connected:
+            try:
+                task = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                yield task
+            except asyncio.TimeoutError:
+                continue
+
+    async def close(self):
+        self._connected = False
+        log.info("LocalMessageBroker closed")
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+
 class MessageBroker:
-    """RabbitMQ message broker for distributed job distribution."""
+    """Message broker for distributed job distribution. Uses RabbitMQ if available, falls back to in-process queue."""
 
     def __init__(self, url: Optional[str] = None):
         self.url = url or os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+        self._backend: Optional[LocalMessageBroker] = None
         self.connection: Optional[AbstractRobustConnection] = None
         self.channel: Optional[AbstractRobustChannel] = None
         self.exchange = None
         self._connected = False
 
     async def connect(self):
-        if not AIO_PIKA_AVAILABLE:
-            log.warning("aio-pika not available, RabbitMQ disabled")
-            return False
-        try:
-            self.connection = await connect_robust(self.url)
-            self.channel = await self.connection.channel()
-            self.exchange = await self.channel.declare_exchange(
-                "forge_tasks", ExchangeType.DIRECT, durable=True
-            )
-            queue = await self.channel.declare_queue("forge_tasks_queue", durable=True)
-            await queue.bind(self.exchange, routing_key="task")
-            self._connected = True
-            log.info("MessageBroker connected to RabbitMQ at %s", self.url)
-            return True
-        except Exception as e:
-            log.warning("RabbitMQ unavailable, falling back to DB polling: %s", e)
-            self._connected = False
-            return False
+        if AIO_PIKA_AVAILABLE:
+            try:
+                self.connection = await connect_robust(self.url)
+                self.channel = await self.connection.channel()
+                self.exchange = await self.channel.declare_exchange(
+                    "forge_tasks", ExchangeType.DIRECT, durable=True
+                )
+                queue = await self.channel.declare_queue("forge_tasks_queue", durable=True)
+                await queue.bind(self.exchange, routing_key="task")
+                self._connected = True
+                log.info("MessageBroker connected to RabbitMQ at %s", self.url)
+                return True
+            except Exception:
+                log.info("RabbitMQ not available, using local in-process queue")
+
+        self._backend = LocalMessageBroker()
+        await self._backend.connect()
+        self._connected = True
+        log.info("MessageBroker using local in-process queue")
+        return True
 
     async def publish_task(self, task_id: int, task_data: dict):
-        if not self._connected:
-            return False
-        try:
-            message = Message(
-                body=json.dumps(task_data).encode(),
-                delivery_mode=DeliveryMode.PERSISTENT,
-                message_id=str(task_id),
-            )
-            await self.exchange.publish(message, routing_key="task")
-            log.info("Published task %d to RabbitMQ", task_id)
-            return True
-        except Exception as e:
-            log.error("Failed to publish task %d: %s", task_id, e)
-            return False
+        if self.connection and self._connected:
+            try:
+                message = Message(
+                    body=json.dumps(task_data).encode(),
+                    delivery_mode=DeliveryMode.PERSISTENT,
+                    message_id=str(task_id),
+                )
+                await self.exchange.publish(message, routing_key="task")
+                log.info("Published task %d to RabbitMQ", task_id)
+                return True
+            except Exception as e:
+                log.error("Failed to publish task %d to RabbitMQ: %s", task_id, e)
+                return False
+
+        if self._backend:
+            return await self._backend.publish_task(task_id, task_data)
+        return False
 
     async def consume_tasks(self, callback):
-        if not self._connected:
-            return
-        queue = await self.channel.declare_queue("forge_tasks_queue", durable=True)
-        await queue.consume(callback)
+        if self.connection and self._connected:
+            queue = await self.channel.declare_queue("forge_tasks_queue", durable=True)
+            await queue.consume(callback)
+        elif self._backend:
+            async for task in self._backend.consume():
+                await callback(task)
 
     async def acknowledge(self, delivery_tag):
-        if not self._connected:
-            return
-        await self.channel.basic_ack(delivery_tag)
+        if self.connection and self._connected:
+            await self.channel.basic_ack(delivery_tag)
 
     async def close(self):
+        if self._backend:
+            await self._backend.close()
         if self.connection:
             await self.connection.close()
-            self._connected = False
-            log.info("MessageBroker connection closed")
+        self._connected = False
+        log.info("MessageBroker connection closed")
 
     @property
     def is_connected(self) -> bool:
@@ -1265,6 +1615,7 @@ agents = {
     "critic": CriticAgent(memory),
     "learner": LearnerAgent(memory)
 }
+pipeline_executor = PipelineExecutor(memory, agents, task_queue)
 
 class ResearchTask(BaseModel):
     task_name: str
@@ -1275,6 +1626,14 @@ class WorkerRegistration(BaseModel):
 
 class TaskCompletion(BaseModel):
     result: str
+
+class PipelineDef(BaseModel):
+    name: str
+    description: str
+    definition: dict
+
+class PipelineRunInfo(BaseModel):
+    pipeline_id: int
 
 # ============================================================================
 # ENDPOINTS
@@ -1643,6 +2002,68 @@ async def get_reuse_rate():
     log.info("API: get_reuse_rate")
     return await memory.get_reuse_rate()
 
+# -----------------------------------------------------------------------
+# Multi-Task Workflow Pipelines
+# -----------------------------------------------------------------------
+
+@app.post("/pipelines")
+async def create_pipeline(pipeline: PipelineDef):
+    log.info("API: create_pipeline '%s'", pipeline.name)
+    try:
+        pipeline_id = await pipeline_executor.create_pipeline(pipeline.name, pipeline.description, pipeline.definition)
+        return {"pipeline_id": pipeline_id, "status": "created", "name": pipeline.name}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/pipelines")
+async def list_pipelines():
+    log.info("API: list_pipelines")
+    return {"pipelines": await pipeline_executor.list_pipelines()}
+
+@app.get("/pipelines/{pipeline_id}")
+async def get_pipeline(pipeline_id: int):
+    log.info("API: get_pipeline id=%d", pipeline_id)
+    pipeline = await pipeline_executor.get_pipeline(pipeline_id)
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    return pipeline
+
+@app.delete("/pipelines/{pipeline_id}")
+async def delete_pipeline(pipeline_id: int):
+    log.info("API: delete_pipeline id=%d", pipeline_id)
+    await pipeline_executor.delete_pipeline(pipeline_id)
+    return {"status": "deleted", "pipeline_id": pipeline_id}
+
+@app.post("/pipelines/{pipeline_id}/run")
+async def run_pipeline(pipeline_id: int):
+    log.info("API: run_pipeline id=%d", pipeline_id)
+    try:
+        run_id = await pipeline_executor.run_pipeline(pipeline_id)
+        return {"run_id": run_id, "status": "started"}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/pipeline-runs")
+async def list_pipeline_runs():
+    log.info("API: list_pipeline_runs")
+    return {"runs": await pipeline_executor.list_runs()}
+
+@app.get("/pipeline-runs/{run_id}")
+async def get_pipeline_run(run_id: int):
+    log.info("API: get_pipeline_run id=%d", run_id)
+    run = await pipeline_executor.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run
+
+@app.get("/pipeline-runs/{run_id}/stream")
+async def stream_pipeline_run(run_id: int):
+    log.info("API: stream_pipeline_run id=%d", run_id)
+    run = await pipeline_executor.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return StreamingResponse(pipeline_executor.stream_run(run_id), media_type="text/event-stream")
+
 @app.post("/workers/register")
 async def register_worker(worker: WorkerRegistration):
     log.info("API: register_worker '%s'", worker.worker_id)
@@ -1683,7 +2104,8 @@ async def root():
             "Persistent Learning Memory with Vector Search",
             "Distributed Task Orchestration",
             "PostgreSQL Database Support",
-            "Knowledge Sharing & Discovery Trending"
+            "Knowledge Sharing & Discovery Trending",
+            "Multi-Task Workflow Pipelines"
         ],
         "endpoints": {
             "health": {
@@ -1701,6 +2123,16 @@ async def root():
                 "GET /discoveries/trending": "Get trending discoveries (Phase 3)",
                 "GET /patterns/search": "Search reusable patterns (Phase 3)",
                 "GET /patterns/cross-domain": "Find cross-domain patterns (Phase 3)"
+            },
+            "pipelines": {
+                "POST /pipelines": "Create a pipeline definition",
+                "GET /pipelines": "List all pipeline definitions",
+                "GET /pipelines/{id}": "Get pipeline definition details",
+                "DELETE /pipelines/{id}": "Delete a pipeline definition",
+                "POST /pipelines/{id}/run": "Execute a pipeline",
+                "GET /pipeline-runs": "List all pipeline runs",
+                "GET /pipeline-runs/{id}": "Get run status and results",
+                "GET /pipeline-runs/{id}/stream": "SSE stream of pipeline progress"
             },
             "workers": {
                 "POST /workers/register": "Register a compute worker",
