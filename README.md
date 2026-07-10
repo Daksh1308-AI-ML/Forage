@@ -67,7 +67,7 @@ Starts all services:
 - **prometheus** — metrics store on port 9090
 - **grafana** — dashboards on port 3000 (admin/admin)
 
-## Project Status
+ ## Project Status
 
 - **Phase 1 (Core Platform):** Complete — agents, memory, streaming API, SQLite
 - **Phase 2 (Distributed Compute):** Complete — task queue, worker registration, heartbeat, orphan reassignment
